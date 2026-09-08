@@ -1,0 +1,26 @@
+[project]
+name = "projectx"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Curfewat6", email = "lucas.koh@hotmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "black>=26.5.1",
+    "isort>=9.0.1",
+    "langchain>=1.4.0",
+    "langchain-ollama>=1.1.0",
+    "langchain-openrouter>=0.2.8",
+    "langchain-tavily>=0.2.18",
+    "langgraph>=1.2.11",
+    "python-dotenv>=1.2.3",
+]
+
+[project.scripts]
+projectx = "projectx.main:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
