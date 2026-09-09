@@ -10,15 +10,18 @@ class Reflection(BaseModel):
     superfluous: str = Field(description="Critique of what is superfluous")
 
 
+# class AnswerQuestion(BaseModel):
+#     """Answer the question. Follow this structure"""
+
+#     answer: str = Field(description="~250 word detailed answer to the question")
+#     reflection: Reflection = Field(description="Your reflection to the initial answer")
+#     search_queries: List[str] = Field(
+#         description="1-3 search queries for researching improvements to address the critique of your current answer"
+#     )
+
 class AnswerQuestion(BaseModel):
     """Answer the question. Follow this structure"""
-
     answer: str = Field(description="~250 word detailed answer to the question")
-    reflection: Reflection = Field(description="Your reflection to the initial answer")
-    search_queries: List[str] = Field(
-        description="1-3 search queries for researching improvements to address the critique of your current answer"
-    )
-
 
 class ReviseAnswer(AnswerQuestion):
     """Revise your original answer to your question. Follow this structure"""

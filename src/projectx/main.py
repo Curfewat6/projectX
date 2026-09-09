@@ -1,6 +1,11 @@
 import argparse
 from pathlib import Path
 
+from langsmith import tracing_context
+
+from projectx.graph_builder import build_graph
+from projectx.tool_executor import repository_tree_tool
+
 
 def repository_directory(value: str) -> Path:
     path = Path(value).expanduser()
@@ -11,7 +16,7 @@ def repository_directory(value: str) -> Path:
     return path.resolve()
 
 
-def get_args():
+def get_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--lang",
@@ -27,39 +32,33 @@ def get_args():
     parser.add_argument(
         "--preview",
         action="store_true",
-        help="Print the overview tool's output locally without calling the model.",
+        help="Print the repository tree locally without calling either model.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return args
-
-
-def get_threat_model(lang):
-    from projectx.threat_model_chain import threat_model_prompt_template as base_prompt
-
-    threat_model_prompt = base_prompt.partial(programming_language=lang)
-    return threat_model_prompt
 
 
 def main():
     command_line_arguments = get_args()
-    user_supplied_programming_language = command_line_arguments.lang
-
-    from projectx.familiaraisation_chain import (
-        build_repository_overview,
-        familiarise_repository,
-    )
 
     if command_line_arguments.preview:
-        print(build_repository_overview(command_line_arguments.repo))
+        # Preview stays local, including when LangSmith tracing is configured.
+        with tracing_context(enabled=False):
+            print(
+                repository_tree_tool.invoke(
+                    {"repository_path": str(command_line_arguments.repo)}
+                )
+            )
         return
 
-    print("We are BACK")
-    print("[Info] Starting repository familiarisation...")
-    overview = familiarise_repository(
-        command_line_arguments.repo,
-        user_supplied_programming_language,
+    print("[Info] Running: fetch tree -> familiarise -> fill threat model", flush=True)
+    graph = build_graph()
+    result = graph.invoke(
+        {
+            "repository_path": str(command_line_arguments.repo),
+            "programming_language": command_line_arguments.lang,
+        }
     )
-    print(overview.text)
 
 
 if __name__ == "__main__":
