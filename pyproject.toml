@@ -3,9 +3,7 @@ name = "projectx"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-authors = [
-    { name = "Curfewat6", email = "lucas.koh@hotmail.com" }
-]
+
 requires-python = ">=3.12"
 dependencies = [
     "black>=26.5.1",
