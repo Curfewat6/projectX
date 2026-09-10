@@ -13,13 +13,17 @@ from projectx.familiaraisation_chain import (
 )
 from projectx.reflection_chain import reflect_threat_model
 from projectx.schemas import AnswerQuestion, Reflection, ReflectionDecision, ThreatModel
-from projectx.threat_model_chain import generate_threat_model
+from projectx.threat_model_chain import (
+    build_threat_model_improver,
+    generate_threat_model,
+)
 from projectx.tool_executor import make_read_file_tool, repository_tree_tool
 
-MAX_FILE_READS = 8
+MAX_FILE_READS = 25
 MAX_FAMILIARISATION_TURNS = 10
+MAX_IMPROVEMENT_TURNS = 10
 MAX_CHECKLIST_CHARS = 8000
-MAX_REVISIONS = 3  # Initial draft is revision 0; permit three improvements.
+MAX_ITERATIONS = 5  # The final visit to reflect stops without another LLM call.
 
 
 class ProjectState(TypedDict):
@@ -30,15 +34,17 @@ class ProjectState(TypedDict):
     repository_tree: NotRequired[str]
     checklist: NotRequired[str]
     familiarisation: NotRequired[str]
+    improvements: NotRequired[str]
     evidence: NotRequired[list[dict]]
     read_errors: NotRequired[list[str]]
     threat_model: NotRequired[ThreatModel]
     revision_count: NotRequired[int]
-    reflection: NotRequired[Reflection]
-    needs_revision: NotRequired[bool]
-    reflection_reason: NotRequired[str]
+    iteration_count: NotRequired[int]
+    reflection: NotRequired[Reflection | None]
+    needs_revision: NotRequired[bool | None]
+    reflection_reason: NotRequired[str | None]
     history: NotRequired[list[dict]]
-    stop_reason: NotRequired[Literal["approved", "max_revisions"] | None]
+    stop_reason: NotRequired[Literal["approved", "max_iterations"] | None]
 
 
 def fetch_tree(state: ProjectState):
@@ -84,7 +90,9 @@ def read_threatmodel(state: ProjectState):
     return {"checklist": checklist}
 
 
-def _overview_from_response(response: AIMessage) -> str:
+def _overview_from_response(
+    response: AIMessage, *, stage: str = "Familiarisation"
+) -> str:
     """Validate the terminal schema call; never execute it as a file tool."""
 
     # AnswerQuestion is an output schema here, not a filesystem tool to execute.
@@ -94,17 +102,15 @@ def _overview_from_response(response: AIMessage) -> str:
         or len(response.tool_calls) != 1
         or response.tool_calls[0]["name"] != "AnswerQuestion"
     ):
-        raise RuntimeError(
-            "Familiarisation must return exactly one AnswerQuestion tool call."
-        )
+        raise RuntimeError(f"{stage} must return exactly one AnswerQuestion tool call.")
     try:
         overview = AnswerQuestion.model_validate(response.tool_calls[0]["args"])
     except ValidationError as error:
         raise RuntimeError(
-            "Familiarisation returned invalid AnswerQuestion arguments."
+            f"{stage} returned invalid AnswerQuestion arguments."
         ) from error
     if not overview.answer.strip():
-        raise RuntimeError("Familiarisation returned an empty answer.")
+        raise RuntimeError(f"{stage} returned an empty answer.")
 
     return overview.answer
 
@@ -123,17 +129,11 @@ def _prior_review_context(state: ProjectState) -> str:
         for item in state.get("history", [])
     ]
     latest = state.get("reflection")
-    # During fill_threat_model, state['familiarisation'] is already the NEW
-    # overview. Retrieve the reviewed overview from its immutable history entry.
-    history = state.get("history", [])
-    previous_overview = (
-        history[-1]["familiarisation"] if history else state.get("familiarisation", "")
-    )
     return (
-        f"Completed revisions: {state.get('revision_count', 0)} / {MAX_REVISIONS}\n\n"
+        f"Upcoming iteration: {state.get('iteration_count', 0) + 1} / {MAX_ITERATIONS}\n"
+        f"Completed revisions: {state.get('revision_count', 0)}\n\n"
         "Previous threat model (an assessment, not independent source evidence):\n"
         f"{state['threat_model'].model_dump_json()}\n\n"
-        f"Previous familiarisation overview:\n{previous_overview}\n\n"
         "Latest critique to address (may itself contain mistakes):\n"
         f"{latest.model_dump_json() if latest is not None else 'Not reviewed yet.'}\n"
         f"Decision rationale: {state.get('reflection_reason', '')}\n\n"
@@ -143,10 +143,9 @@ def _prior_review_context(state: ProjectState) -> str:
 
 
 def familiarise(state: ProjectState):
-    """Read toward the checklist/critique while preserving earlier evidence."""
+    """Collect the initial architectural overview and source evidence once."""
     read_tool = make_read_file_tool(state["repository_path"])
     familiariser = build_familiariser(read_tool)
-    execute_reads = ToolNode([read_tool], handle_tool_errors=True)
     messages = [
         HumanMessage(
             content=(
@@ -156,29 +155,70 @@ def familiarise(state: ProjectState):
             )
         )
     ]
+    return _inspect_sources(
+        state,
+        familiariser,
+        read_tool,
+        messages,
+        stage="Familiarisation",
+        summary_key="familiarisation",
+        max_turns=MAX_FAMILIARISATION_TURNS,
+    )
+
+
+def improve_threat_model(state: ProjectState):
+    """Investigate the critique and propose corrections for the next writer pass."""
+    if "threat_model" not in state or state.get("reflection") is None:
+        raise RuntimeError(
+            "Improvement requires a threat model and reflection critique."
+        )
+    if state.get("iteration_count", 0) >= MAX_ITERATIONS:
+        raise RuntimeError("The reflection-iteration limit has already been reached.")
+
+    read_tool = make_read_file_tool(state["repository_path"])
+    improver = build_threat_model_improver(read_tool)
+    messages = [
+        HumanMessage(
+            content=(
+                "Address the latest critique with evidence-backed improvements. "
+                "Use existing excerpts and targeted additional reads as needed. "
+                "The next fill_threat_model node will write the revised report.\n\n"
+                f"{_prior_review_context(state)}\n\n"
+                f"{_evidence_context(state)}"
+            )
+        )
+    ]
+    return _inspect_sources(
+        state,
+        improver,
+        read_tool,
+        messages,
+        stage="Threat-model improvement",
+        summary_key="improvements",
+        max_turns=MAX_IMPROVEMENT_TURNS,
+    )
+
+
+def _inspect_sources(
+    state: ProjectState,
+    inspector,
+    read_tool,
+    messages: list,
+    *,
+    stage: str,
+    summary_key: Literal["familiarisation", "improvements"],
+    max_turns: int,
+):
+    """Share bounded tool execution, not the two nodes' prompts or responsibilities."""
+    execute_reads = ToolNode([read_tool], handle_tool_errors=True)
     # Copy the lists: return updated state without mutating prior graph snapshots.
     evidence = [dict(item) for item in state.get("evidence", [])]
     read_errors = list(state.get("read_errors", []))
-    previous_work = _prior_review_context(state)
-    if previous_work:
-        messages.append(
-            HumanMessage(
-                content=(
-                    "This is a revision pass. Address the latest critique using the "
-                    "existing evidence and targeted additional reads as needed. "
-                    "Do not restart discovery or assume earlier claims are facts.\n\n"
-                    f"{previous_work}\n\n"
-                    "Previously collected source evidence (reuse these source IDs):\n"
-                    f"{json.dumps(evidence, ensure_ascii=False)}\n\n"
-                    f"Previous failed or empty reads:\n{json.dumps(read_errors)}"
-                )
-            )
-        )
     read_count = 0
     seen_call_ids = set()
 
-    for _ in range(MAX_FAMILIARISATION_TURNS):
-        response = familiariser.invoke(
+    for _ in range(max_turns):
+        response = inspector.invoke(
             {
                 "language": state["programming_language"],
                 "checklist": state["checklist"],
@@ -192,7 +232,7 @@ def familiarise(state: ProjectState):
             or not response.tool_calls
         ):
             raise RuntimeError(
-                "Familiarisation must request read_file or finish with AnswerQuestion."
+                f"{stage} must request read_file or finish with AnswerQuestion."
             )
 
         for call in response.tool_calls:
@@ -203,25 +243,25 @@ def familiarise(state: ProjectState):
 
         names = [call["name"] for call in response.tool_calls]
         if "AnswerQuestion" in names:
-            overview = _overview_from_response(response)
+            overview = _overview_from_response(response, stage=stage)
             if not evidence:
                 raise RuntimeError(
-                    "Familiarisation finished without successfully reading a nonempty file. "
+                    f"{stage} finished without successfully reading a nonempty file. "
                     "No source-backed threat model can be produced."
                 )
             return {
-                "familiarisation": overview,
+                summary_key: overview,
                 "evidence": evidence,
                 "read_errors": read_errors,
             }
 
         if any(name != "read_file" for name in names):
             raise RuntimeError(
-                "Only the read_file tool is available during familiarisation."
+                f"Only the read_file tool is available during {stage.lower()}."
             )
         if read_count + len(names) > MAX_FILE_READS:
             raise RuntimeError(
-                f"Familiarisation exceeded its {MAX_FILE_READS}-call file-read budget."
+                f"{stage} exceeded its {MAX_FILE_READS}-call file-read budget."
             )
 
         read_count += len(names)
@@ -247,14 +287,12 @@ def familiarise(state: ProjectState):
                 read_errors.append(str(result.content))
             messages.append(result)
 
-    raise RuntimeError(
-        f"Familiarisation did not finish within {MAX_FAMILIARISATION_TURNS} model turns."
-    )
+    raise RuntimeError(f"{stage} did not finish within {max_turns} model turns.")
 
 
 def _evidence_context(state: ProjectState) -> str:
     """The same observed material is supplied to both the writer and reviewer."""
-    return (
+    context = (
         f"Selected repository: {state['repository_path']}\n\n"
         "Coverage: tree plus ONLY the source excerpts recorded below. "
         "Unlisted files and omitted lines have not been read. A read is not a "
@@ -267,22 +305,29 @@ def _evidence_context(state: ProjectState) -> str:
         f"{json.dumps(state['evidence'], ensure_ascii=False)}\n\n"
         f"Failed or empty reads:\n{json.dumps(state['read_errors'], ensure_ascii=False)}"
     )
+    if state.get("improvements"):
+        context += (
+            "\n\nLatest improvement findings and proposed corrections "
+            "(interpretation, not independent source evidence):\n"
+            f"{state['improvements']}"
+        )
+    return context
 
 
 def fill_threat_model(state: ProjectState):
     """Write/revise from evidence and critique, counting completed improvements."""
     revision_count = state.get("revision_count", 0)
     is_revision = "threat_model" in state
-    if is_revision and revision_count >= MAX_REVISIONS:
+    if is_revision and revision_count >= MAX_ITERATIONS - 1:
         raise RuntimeError(
-            f"The {MAX_REVISIONS}-revision limit has already been reached."
+            f"The {MAX_ITERATIONS}-iteration limit has already been reached."
         )
 
     context = _evidence_context(state)
     if is_revision:
         context += (
-            "\n\nRevise the previous threat model using the latest critique and "
-            "the evidence above. Preserve supported material, correct unsupported "
+            "\n\nRevise the previous threat model using the improvement findings, "
+            "latest critique, and evidence above. Preserve supported material, correct unsupported "
             "claims, and leave unresolved facts explicitly unknown.\n\n"
             + _prior_review_context(state)
         )
@@ -294,12 +339,27 @@ def fill_threat_model(state: ProjectState):
 
 
 def reflection_node(state: ProjectState):
-    """Critique the completed report and record the model's improve/end decision."""
+    """Stop on the final visit; otherwise critique the report and record a decision. Be genuine. If an improvement is warranted, proceed. If not, STOP."""
+    iteration_count = state.get("iteration_count", 0) + 1
+    if iteration_count >= MAX_ITERATIONS:
+        # Check BEFORE building the prompt or calling the model. The conditional
+        # edge will return END; a StateGraph node itself returns state updates.
+        # Earlier critiques stay in history, but none reviewed this final report.
+        return {
+            "iteration_count": iteration_count,
+            "reflection": None,
+            "needs_revision": None,
+            "reflection_reason": None,
+            "stop_reason": "max_iterations",
+        }
+
     revision_count = state.get("revision_count", 0)
     context = (
+        f"Reflection iteration {iteration_count} of {MAX_ITERATIONS}.\n"
         f"Review the current threat model: revision {revision_count}.\n"
-        "The initial draft is revision 0. A stop at the revision cap does not "
-        "mean this report was approved; honestly record remaining issues.\n\n"
+        "The initial draft is revision 0. The final iteration stops automatically "
+        "without another critique. Review this report honestly; the iteration "
+        "limit is not evidence that remaining issues are resolved.\n\n"
         f"Current threat model:\n{state['threat_model'].model_dump_json()}\n\n"
         f"{_evidence_context(state)}\n\n"
         "Previous critiques (use to check whether feedback was addressed):\n"
@@ -320,33 +380,35 @@ def reflection_node(state: ProjectState):
         raise RuntimeError("Reflection did not return a validated ReflectionDecision.")
 
     iteration = {
+        "iteration": iteration_count,
         "revision": revision_count,
         "threat_model": state["threat_model"].model_dump(mode="json"),
         "reflection": review.reflection.model_dump(mode="json"),
         "needs_revision": review.needs_revision,
         "reason": review.reason,
         "familiarisation": state["familiarisation"],
+        "improvements": state.get("improvements", ""),
         "evidence_ids": [item["id"] for item in state["evidence"]],
         "read_errors": list(state["read_errors"]),
     }
-    stop_reason = None
-    if not review.needs_revision:
-        stop_reason = "approved"
-    elif revision_count >= MAX_REVISIONS:
-        stop_reason = "max_revisions"
     return {
+        "iteration_count": iteration_count,
         "reflection": review.reflection,
         "needs_revision": review.needs_revision,
         "reflection_reason": review.reason,
         "history": [*state.get("history", []), iteration],
-        "stop_reason": stop_reason,
+        "stop_reason": None if review.needs_revision else "approved",
     }
 
 
-def route_after_reflection(state: ProjectState) -> Literal["familiarise", "__end__"]:
+def route_after_reflection(
+    state: ProjectState,
+) -> Literal["improve_threat_model", "__end__"]:
     """The model chooses whether improvement is useful; code enforces the cap."""
-    if state["needs_revision"] and state.get("revision_count", 0) < MAX_REVISIONS:
-        return "familiarise"
+    if state.get("iteration_count", 0) >= MAX_ITERATIONS:
+        return END
+    if state["needs_revision"]:
+        return "improve_threat_model"
     return END
 
 
@@ -357,6 +419,7 @@ def build_graph():
     builder.add_node("familiarise", familiarise)
     builder.add_node("fill_threat_model", fill_threat_model)
     builder.add_node("reflect", reflection_node)
+    builder.add_node("improve_threat_model", improve_threat_model)
 
     builder.add_edge(START, "fetch_tree")
     builder.add_edge("fetch_tree", "read_threatmodel")
@@ -364,8 +427,11 @@ def build_graph():
     builder.add_edge("familiarise", "fill_threat_model")
     builder.add_edge("fill_threat_model", "reflect")
     builder.add_conditional_edges(
-        "reflect", route_after_reflection, {"familiarise": "familiarise", END: END}
+        "reflect",
+        route_after_reflection,
+        {"improve_threat_model": "improve_threat_model", END: END},
     )
+    builder.add_edge("improve_threat_model", "fill_threat_model")
 
     graph = builder.compile()
 

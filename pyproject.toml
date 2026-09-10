@@ -8,6 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     "black>=26.5.1",
     "isort>=9.0.1",
+    "jsonschema2md>=1.7.0",
     "langchain>=1.4.0",
     "langchain-community>=0.4.2",
     "langchain-ollama>=1.1.0",

@@ -16,11 +16,8 @@ from langgraph.prebuilt import ToolNode
 from pydantic import ValidationError
 
 with patch("dotenv.load_dotenv", return_value=False):
-    from projectx.tool_executor import (
-        MAX_FILE_BYTES,
-        MAX_READ_CHARS,
-        make_read_file_tool,
-    )
+    from projectx import tool_executor
+    from projectx.tool_executor import make_read_file_tool
 
 
 class RepositoryReaderTests(unittest.TestCase):
@@ -69,7 +66,7 @@ class RepositoryReaderTests(unittest.TestCase):
             },
         )
 
-    def test_range_and_character_limits_preserve_exact_excerpt(self):
+    def test_explicit_range_preserves_exact_excerpt(self):
         source = "one\ntwo\nthree\nfour\n"
         (self.root / "source.py").write_text(source, encoding="utf-8")
         message = self.read("source.py", start_line=2, max_lines=2)
@@ -77,15 +74,6 @@ class RepositoryReaderTests(unittest.TestCase):
         self.assertEqual(message.artifact["start_line"], 2)
         self.assertEqual(message.artifact["end_line"], 3)
         self.assertTrue(message.artifact["truncated"])
-
-        (self.root / "long.txt").write_text(
-            "a" * (MAX_READ_CHARS + 50), encoding="utf-8"
-        )
-        long_message = self.read("long.txt")
-        self.assertEqual(long_message.artifact["content"], "a" * MAX_READ_CHARS)
-        self.assertEqual(long_message.artifact["end_line"], 1)
-        self.assertTrue(long_message.artifact["truncated"])
-        self.assertIn("final displayed line may be partial", long_message.content)
 
     def test_dynamic_roots_cannot_be_overridden_by_model(self):
         second_root = self.base / "second"
@@ -103,12 +91,110 @@ class RepositoryReaderTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.reader.invoke({"file_path": "same.txt", "root_dir": str(second_root)})
 
-    def test_default_and_maximum_line_counts(self):
-        (self.root / "many_lines.txt").write_text("line\n" * 120, encoding="utf-8")
-        self.assertEqual(self.read("many_lines.txt").artifact["end_line"], 60)
-        maximum = self.read("many_lines.txt", max_lines=100)
-        self.assertEqual(maximum.artifact["end_line"], 100)
-        self.assertTrue(maximum.artifact["truncated"])
+    def test_default_and_null_requests_return_large_files_without_old_caps(self):
+        source = ("x" * 2100 + "\n") * 130
+        self.assertGreater(len(source.encode()), 256 * 1024)
+        (self.root / "large.txt").write_text(source, encoding="utf-8")
+        for arguments in ({}, {"max_lines": None}):
+            with self.subTest(arguments=arguments):
+                message = self.read("large.txt", **arguments)
+                self.assertEqual(message.artifact["content"], source)
+                self.assertEqual(message.artifact["start_line"], 1)
+                self.assertEqual(message.artifact["end_line"], 130)
+                self.assertFalse(message.artifact["truncated"])
+                self.assertEqual(
+                    message.artifact["sha256"],
+                    hashlib.sha256(source.encode()).hexdigest(),
+                )
+                self.assertIn("130: " + "x" * 2100, message.content)
+                self.assertNotIn("Character limit reached", message.content)
+        content, artifact = self.reader._run("large.txt")
+        self.assertEqual(artifact["content"], source)
+        self.assertFalse(artifact["truncated"])
+        self.assertIn("Lines: 1-130", content)
+
+    def test_requested_ranges_can_exceed_one_hundred_lines(self):
+        lines = [
+            f"line {index:03d} with synthetic source text\n" for index in range(1, 161)
+        ]
+        (self.root / "many_lines.txt").write_text("".join(lines), encoding="utf-8")
+        selected = self.read("many_lines.txt", start_line=10, max_lines=130)
+        self.assertEqual(selected.artifact["content"], "".join(lines[9:139]))
+        self.assertEqual(selected.artifact["start_line"], 10)
+        self.assertEqual(selected.artifact["end_line"], 139)
+        self.assertTrue(selected.artifact["truncated"])
+        for arguments in ({}, {"max_lines": None}):
+            with self.subTest(arguments=arguments):
+                remainder = self.read("many_lines.txt", start_line=10, **arguments)
+                self.assertEqual(remainder.artifact["content"], "".join(lines[9:]))
+                self.assertEqual(remainder.artifact["end_line"], 160)
+                self.assertTrue(remainder.artifact["truncated"])
+
+    def test_long_single_line_unicode_is_returned_intact(self):
+        source = "😀漢é" * 3000
+        (self.root / "unicode.txt").write_text(source, encoding="utf-8")
+        message = self.read("unicode.txt")
+        self.assertEqual(message.artifact["content"], source)
+        self.assertEqual(message.artifact["end_line"], 1)
+        self.assertFalse(message.artifact["truncated"])
+        self.assertTrue(message.content.endswith("1: " + source))
+        self.assertEqual(
+            message.artifact["sha256"], hashlib.sha256(source.encode()).hexdigest()
+        )
+
+    def test_file_byte_cap_can_be_enabled_independently(self):
+        (self.root / "at_limit.txt").write_text("x" * 64, encoding="utf-8")
+        (self.root / "over_limit.txt").write_text("x" * 65, encoding="utf-8")
+        # Byte limits concern encoded file size, not Python character count.
+        (self.root / "unicode.txt").write_text("é" * 40, encoding="utf-8")
+        with patch.multiple(
+            tool_executor, MAX_FILE_BYTES=64, MAX_READ_CHARS=None, MAX_READ_LINES=None
+        ):
+            self.assertEqual(self.read("at_limit.txt").artifact["content"], "x" * 64)
+            for request in ("over_limit.txt", "unicode.txt"):
+                for arguments in ({}, {"max_lines": 1}, {"max_lines": None}):
+                    with (
+                        self.subTest(request=request, arguments=arguments),
+                        self.assertRaises(ToolException),
+                    ):
+                        self.read(request, **arguments)
+
+    def test_character_cap_can_be_enabled_independently_without_splitting_unicode(self):
+        source = "😀漢é" * 100
+        (self.root / "unicode.txt").write_text(source, encoding="utf-8")
+        with patch.multiple(
+            tool_executor, MAX_FILE_BYTES=None, MAX_READ_CHARS=10, MAX_READ_LINES=None
+        ):
+            for arguments in ({}, {"max_lines": None}, {"max_lines": 1000}):
+                with self.subTest(arguments=arguments):
+                    message = self.read("unicode.txt", **arguments)
+                    self.assertEqual(message.artifact["content"], source[:10])
+                    self.assertEqual(message.artifact["end_line"], 1)
+                    self.assertTrue(message.artifact["truncated"])
+                    self.assertIn(
+                        "final displayed line may be partial", message.content
+                    )
+
+    def test_line_cap_cannot_be_bypassed_by_omission_null_or_larger_requests(self):
+        lines = [f"line {index}\n" for index in range(1, 11)]
+        (self.root / "many_lines.txt").write_text("".join(lines), encoding="utf-8")
+        with patch.multiple(
+            tool_executor, MAX_FILE_BYTES=None, MAX_READ_CHARS=None, MAX_READ_LINES=3
+        ):
+            for arguments in ({}, {"max_lines": None}, {"max_lines": 1000}):
+                with self.subTest(arguments=arguments):
+                    message = self.read("many_lines.txt", **arguments)
+                    self.assertEqual(message.artifact["content"], "".join(lines[:3]))
+                    self.assertEqual(message.artifact["end_line"], 3)
+                    self.assertTrue(message.artifact["truncated"])
+                    _, artifact = self.reader._run("many_lines.txt", **arguments)
+                    self.assertEqual(artifact["content"], "".join(lines[:3]))
+            smaller = self.read("many_lines.txt", start_line=2, max_lines=2)
+            self.assertEqual(smaller.artifact["content"], "".join(lines[1:3]))
+            self.assertEqual(smaller.artifact["end_line"], 3)
+            later = self.read("many_lines.txt", start_line=2, max_lines=1000)
+            self.assertEqual(later.artifact["content"], "".join(lines[1:4]))
+            self.assertEqual(later.artifact["end_line"], 4)
 
     def test_factory_requires_an_existing_directory(self):
         (self.root / "source.py").write_text("source", encoding="utf-8")
@@ -167,16 +253,14 @@ class RepositoryReaderTests(unittest.TestCase):
             with self.subTest(request=request), self.assertRaises(ToolException):
                 self.read(request)
 
-    def test_rejects_directories_binary_non_utf8_and_oversized_files(self):
+    def test_rejects_directories_binary_non_utf8_and_missing_files(self):
         (self.root / "directory").mkdir()
         (self.root / "binary.dat").write_bytes(b"hello\x00world")
         (self.root / "not_utf8.txt").write_bytes(b"\xff\xfe")
-        (self.root / "too_large.txt").write_bytes(b"x" * (MAX_FILE_BYTES + 1))
         for request in (
             "directory",
             "binary.dat",
             "not_utf8.txt",
-            "too_large.txt",
             "missing.txt",
         ):
             with self.subTest(request=request), self.assertRaises(ToolException):
@@ -194,6 +278,33 @@ class RepositoryReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolException, "root changed"):
             self.read("source.py")
 
+    def test_growing_file_is_rejected_without_chasing_more_content(self):
+        location = self.root / "growing.txt"
+        location.write_text("original\n", encoding="utf-8")
+        original_read = os.read
+        read_calls = 0
+
+        def read_while_file_grows(descriptor, count):
+            nonlocal read_calls
+            read_calls += 1
+            self.assertLessEqual(read_calls, 2, "Reader must not chase file growth.")
+            with location.open("a", encoding="utf-8") as growing_file:
+                growing_file.write("new content\n" * 20)
+            return original_read(descriptor, count)
+
+        with (
+            patch.multiple(
+                tool_executor,
+                MAX_FILE_BYTES=None,
+                MAX_READ_CHARS=None,
+                MAX_READ_LINES=None,
+            ),
+            patch.object(tool_executor.os, "read", side_effect=read_while_file_grows),
+            self.assertRaisesRegex(ToolException, "File changed during the read"),
+        ):
+            self.read("growing.txt")
+        self.assertEqual(read_calls, 1)
+
     def test_empty_file_and_out_of_range(self):
         (self.root / "empty.txt").write_text("", encoding="utf-8")
         message = self.read("empty.txt")
@@ -206,9 +317,15 @@ class RepositoryReaderTests(unittest.TestCase):
     def test_argument_validation(self):
         for arguments in (
             {"start_line": 0},
+            {"start_line": -1},
             {"start_line": True},
+            {"start_line": False},
+            {"start_line": "5"},
+            {"start_line": None},
             {"max_lines": 0},
-            {"max_lines": 101},
+            {"max_lines": -1},
+            {"max_lines": True},
+            {"max_lines": False},
             {"max_lines": "5"},
         ):
             with self.subTest(arguments=arguments), self.assertRaises(ValidationError):

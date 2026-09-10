@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class Reflection(BaseModel):
+    """Reflect on the threat model provided. Be severe to ensure proper critique."""
     missing: str = Field(description="Critique of what is missing.")
     superfluous: str = Field(description="Critique of what is superfluous")
 
@@ -280,7 +281,7 @@ class DecisionLogEntry(_ThreatModelSection):
 
 
 class ThreatModel(BaseModel):
-    """Structured report matching THREAT_MODE_TEMPLATE.md.
+    """You must adhere to this template field for field to a T at ALL COSTS!
 
     Include all twelve sections. Keep prose concise and mark unknown or
     unassessed information explicitly instead of inventing facts. Numbered

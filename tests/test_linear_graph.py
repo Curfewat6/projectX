@@ -28,7 +28,13 @@ with (
     from langsmith import get_tracing_context, tracing_context
     from pydantic import ValidationError
 
-    from projectx import graph_builder
+    from projectx import (
+        familiaraisation_chain,
+        graph_builder,
+        reflection_chain,
+        threat_model_chain,
+    )
+    from projectx.llm import llm
     from projectx.schemas import Reflection, ReflectionDecision, ThreatModel
 
     cli = importlib.import_module("projectx.main")
@@ -179,12 +185,23 @@ class LinearGraphTests(unittest.TestCase):
             )
         return result, chain
 
+    def test_all_chains_share_centrally_configured_model(self):
+        for module in (
+            familiaraisation_chain,
+            threat_model_chain,
+            reflection_chain,
+        ):
+            with self.subTest(module=module.__name__):
+                self.assertIs(module.llm, llm)
+        self.assertIs(familiaraisation_chain.read_threatmodel_chain.last, llm)
+
     def test_build_graph_prints_mermaid_without_running_steps(self):
         output = io.StringIO()
         with (
             patch.object(graph_builder, "repository_tree_tool") as tree,
             patch.object(graph_builder, "read_threatmodel_chain") as planner,
             patch.object(graph_builder, "build_familiariser") as familiariser,
+            patch.object(graph_builder, "build_threat_model_improver") as improver,
             patch.object(graph_builder, "generate_threat_model") as generate,
             patch.object(graph_builder, "reflect_threat_model") as reflect,
             redirect_stdout(output),
@@ -194,6 +211,7 @@ class LinearGraphTests(unittest.TestCase):
         tree.invoke.assert_not_called()
         planner.invoke.assert_not_called()
         familiariser.assert_not_called()
+        improver.assert_not_called()
         generate.assert_not_called()
         reflect.assert_not_called()
 
@@ -208,14 +226,18 @@ class LinearGraphTests(unittest.TestCase):
             "reflect",
             "__end__",
         ]
-        self.assertEqual(set(graph.nodes), set(nodes))
+        self.assertEqual(set(graph.nodes), set(nodes) | {"improve_threat_model"})
         self.assertEqual(
             {(edge.source, edge.target) for edge in graph.edges},
-            set(zip(nodes, nodes[1:])) | {("reflect", "familiarise")},
+            set(zip(nodes, nodes[1:]))
+            | {
+                ("reflect", "improve_threat_model"),
+                ("improve_threat_model", "fill_threat_model"),
+            },
         )
         self.assertEqual(
             {(edge.source, edge.target) for edge in graph.edges if edge.conditional},
-            {("reflect", "familiarise"), ("reflect", "__end__")},
+            {("reflect", "improve_threat_model"), ("reflect", "__end__")},
         )
 
     def test_graph_carries_checklist_and_actual_read_evidence_in_order(self):
@@ -309,6 +331,7 @@ class LinearGraphTests(unittest.TestCase):
         calls = []
 
         def generate(model, messages, **kwargs):
+            self.assertIs(model, llm)
             self.assertIn("Rust", messages[0].content)
             names = [tool["function"]["name"] for tool in kwargs.get("tools", [])]
             calls.append(names)
@@ -360,8 +383,27 @@ class LinearGraphTests(unittest.TestCase):
             ),
         ):
             result = graph_builder.build_graph().invoke(self.state)
-        self.assertEqual(len(calls), 5)
-        self.assertEqual(calls[-2:], [["ThreatModel"], ["ReflectionDecision"]])
+            # Binding tools for one stage must not modify the shared base model.
+            planner_response = graph_builder.read_threatmodel_chain.invoke(
+                {
+                    "language": "Rust",
+                    "messages": [
+                        HumanMessage(content="Plan the crown_jewels section.")
+                    ],
+                }
+            )
+        self.assertEqual(
+            calls,
+            [
+                [],
+                ["read_file", "AnswerQuestion"],
+                ["read_file", "AnswerQuestion"],
+                ["ThreatModel"],
+                ["ReflectionDecision"],
+                [],
+            ],
+        )
+        self.assertEqual(planner_response.content, self.checklist)
         self.assertEqual(result["threat_model"], report)
         self.assertEqual(result["stop_reason"], "approved")
 
@@ -372,10 +414,18 @@ class LinearGraphTests(unittest.TestCase):
                 {"name": "ThreatModel", "args": {"status": {}}, "id": "invalid"}
             ],
         )
-        with patch.object(
-            ChatOpenRouter,
-            "_generate",
-            return_value=ChatResult(generations=[ChatGeneration(message=invalid)]),
+        with (
+            patch.object(threat_model_chain, "USE_SCHEMA_CORRECTION", False),
+            patch.object(
+                ChatOllama,
+                "_generate",
+                return_value=ChatResult(generations=[ChatGeneration(message=invalid)]),
+            ),
+            patch.object(
+                ChatOpenRouter,
+                "_generate",
+                return_value=ChatResult(generations=[ChatGeneration(message=invalid)]),
+            ),
         ):
             with self.assertRaises(ValidationError):
                 graph_builder.generate_threat_model("No evidence.", "Rust")

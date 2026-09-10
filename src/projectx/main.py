@@ -3,7 +3,7 @@ from pathlib import Path
 
 from langsmith import tracing_context
 
-from projectx.graph_builder import build_graph
+from projectx.graph_builder import MAX_ITERATIONS, build_graph
 from projectx.tool_executor import repository_tree_tool
 
 
@@ -54,7 +54,8 @@ def main():
     print(
         "[Info] Running: fetch tree -> read threat-model template -> "
         "familiarise (file reads) -> fill threat model -> reflect "
-        "(up to 3 revisions)",
+        "-> improve threat model (if needed) -> fill threat model "
+        f"(up to {MAX_ITERATIONS} reflection visits)",
         flush=True,
     )
     graph = build_graph()
