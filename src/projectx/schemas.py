@@ -10,6 +10,30 @@ class Reflection(BaseModel):
     superfluous: str = Field(description="Critique of what is superfluous")
 
 
+class ReflectionDecision(BaseModel):
+    """Critique the current report and decide whether another discovery pass helps."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    reflection: Reflection = Field(
+        description=(
+            "Critique of missing evidence or explanations and unsupported or "
+            "superfluous material in the current threat model."
+        )
+    )
+    needs_revision: bool = Field(
+        strict=True,
+        description=(
+            "Whether another read-only architecture and evidence-correction pass "
+            "can meaningfully improve the report."
+        ),
+    )
+    reason: str = Field(
+        min_length=1,
+        description="Concise justification for requesting another pass or ending.",
+    )
+
+
 # class AnswerQuestion(BaseModel):
 #     """Answer the question. Follow this structure"""
 

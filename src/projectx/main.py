@@ -51,7 +51,12 @@ def main():
             )
         return
 
-    print("[Info] Running: fetch tree -> familiarise -> fill threat model", flush=True)
+    print(
+        "[Info] Running: fetch tree -> read threat-model template -> "
+        "familiarise (file reads) -> fill threat model -> reflect "
+        "(up to 3 revisions)",
+        flush=True,
+    )
     graph = build_graph()
     result = graph.invoke(
         {
